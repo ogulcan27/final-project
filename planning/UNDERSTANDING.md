@@ -2,7 +2,7 @@
 
 This document explains how the FinAlly project works. It is for readers who are new to system design. It uses short sentences and simple words. Each term is explained the first time it appears.
 
-**Status of the project:** Today the project has two documents: `PLAN.md` and `MARKET_DATA_DESIGN.md`. The application code is not written yet. This document explains the system as it is planned.
+**Status of the project:** The plan is in `PLAN.md`. The market data part is built and tested: the simulator, the Massive client, the price cache and the live price stream (`backend/app/market/`). Its design is in `MARKET_DATA_DESIGN.md` and its review is in `MARKET_DATA_REVIEW.md`. The database, trading, chat, frontend and Docker parts are not written yet. This document explains the whole system as it is planned.
 
 ---
 

@@ -6,9 +6,34 @@ Scope: `backend/app/main.py`, `backend/app/market/*`, `backend/tests/market/*`, 
 
 ## 1. Verdict
 
-**Approve, with one fix before the Massive source is used in production.**
+**Approve, with one fix before the Massive source is used in production.** (Done; see 1a.)
 
 The market data layer is small, readable and matches the design closely. The interface, cache, simulator, factory and SSE stream are correct. The math is correct and the tests verify it statistically. The one real defect is in the Massive poller: an unexpected payload stops polling permanently and silently (finding M1). The simulator path, which is the default, has no defects.
+
+## 1a. Resolution (2026-10-15, follow-up)
+
+All findings below were addressed. The original findings are kept unchanged as the record.
+
+| Finding | Action | Evidence |
+|---|---|---|
+| M1 poll loop dies | `poll_once` logs and skips any unexpected error (`log.exception`); HTTP errors stay a one-line warning | 3 new tests failed before the fix and pass after; the original repro now shows 20 polls in 0.3s with the task alive |
+| M2 no keep-alive | Stream moved to FastAPI native `EventSourceResponse` + `ServerSentEvent` (15s `: ping`, same headers, disconnect handled by the framework) | New real-HTTP test receives `: ping` on an idle stream; live `curl` shows identical wire format; 3 connect/disconnect cycles, no errors |
+| L1 vacuous drift test | Replaced by an exact check: zero shocks, one step equals `S * exp((mu - sigma^2/2) DT)` | Test fails with a drift off by 1.0, passes when correct |
+| L2 float timestamp compare | Change detection now uses `PriceUpdate` identity | New test (two writes with the same timestamp) fails with the old comparison, passes with the new |
+| L3 removals not streamed | Documented for the frontend in `MARKET_DATA_DESIGN.md` section 10 | - |
+| L4 re-add re-seeds price | Documented in `MARKET_DATA_DESIGN.md` section 9 (no code change, by design) | - |
+| L5 slow Massive start | Documented in `MARKET_DATA_DESIGN.md` section 7.4 as an accepted trade-off | - |
+| L6 Python version | `backend/.python-version` pins 3.12 | 54 tests pass on Python 3.12.15 |
+| L6 `.env` loading | Use `uv run --env-file ../.env ...` (no new dependency); documented in `backend/README.md` | Verified the root `.env` keys reach the process |
+| L6 real-HTTP stream test | Added: uvicorn on a free port + `httpx.AsyncClient.stream`; checks headers, `retry`, data, direction | Passes |
+| L6 stray blank line | Removed | - |
+| Doc drift | `UNDERSTANDING.md` status updated; `MARKET_DATA_DESIGN.md` sections 7.2, 7.4, 9, 10, 12 match the code | - |
+
+Final state: **54 tests pass** (was 49), stable over 6 consecutive runs, Python 3.12.15, FastAPI 0.143.1.
+
+Still open, by design:
+- `main.py` lifespan tracks `DEFAULT_TICKERS`. It must become "watchlist UNION open positions" when the database layer is built.
+- No live call to the real Massive API was made (no `MASSIVE_API_KEY` in `.env`). The client is verified against mocked responses only.
 
 ## 2. Test Results
 

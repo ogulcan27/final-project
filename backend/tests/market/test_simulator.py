@@ -2,10 +2,11 @@ import asyncio
 import math
 import random
 
+import pytest
 
 from app.market import PriceCache
 from app.market import simulator
-from app.market.seed_data import SEED_PRICES
+from app.market.seed_data import GBM_PARAMS, SEED_PRICES
 from app.market.simulator import DT, SimulatorSource
 
 
@@ -104,16 +105,21 @@ def test_gbm_log_return_std_matches_sigma(monkeypatch):
     assert abs(std - expected) / expected < 0.05
 
 
-def test_gbm_log_return_mean_matches_drift(monkeypatch):
+class ZeroShocks(random.Random):
+    """Random source whose gaussian shocks are always zero."""
+
+    def gauss(self, mu: float = 0.0, sigma: float = 1.0) -> float:
+        return 0.0
+
+
+def test_gbm_drift_term_is_exact(monkeypatch):
     monkeypatch.setattr(simulator, "EVENT_PROB", 0.0)
-    _, sim = make(seed=11)
+    sim = SimulatorSource(PriceCache(), rng=ZeroShocks())
     sim._seed("AAPL")
-    steps = 20_000
-    logs = log_returns(sim, ["AAPL"], steps)["AAPL"]
-    mean = sum(logs) / steps
-    expected = (0.08 - 0.5 * 0.25**2) * DT
-    std_err = 0.25 * math.sqrt(DT) / math.sqrt(steps)
-    assert abs(mean - expected) < 5 * std_err
+    sim.step()
+    mu, sigma = GBM_PARAMS["AAPL"]
+    expected = SEED_PRICES["AAPL"] * math.exp((mu - 0.5 * sigma**2) * DT)
+    assert sim._prices["AAPL"] == pytest.approx(expected, rel=1e-12)
 
 
 def test_same_sector_more_correlated_than_cross_sector(monkeypatch):

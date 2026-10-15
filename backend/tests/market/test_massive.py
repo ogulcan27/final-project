@@ -122,6 +122,39 @@ async def test_invalid_json_keeps_old_prices():
     assert cache.get_price("AAPL") == 100.0
 
 
+async def test_malformed_payload_keeps_old_prices():
+    cache, src = make_source(lambda r: httpx.Response(200, json={"tickers": None}))
+    cache.update("AAPL", 100.0)
+    src._tickers = {"AAPL"}
+    await src.poll_once()
+    assert cache.get_price("AAPL") == 100.0
+
+
+async def test_polling_survives_malformed_payload():
+    count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal count
+        count += 1
+        if count == 2:
+            return httpx.Response(200, json={"tickers": [{"lastTrade": {"p": 1.0}}]})
+        return httpx.Response(200, json=SAMPLE)
+
+    cache, src = make_source(handler, poll_seconds=0.01)
+    await src.start(["AAPL"])
+    await asyncio.sleep(0.1)
+    assert count > 3
+    assert not src._task.done()
+    await src.stop()
+
+
+async def test_start_survives_malformed_first_payload():
+    cache, src = make_source(lambda r: httpx.Response(200, json=[1, 2]))
+    await src.start(["AAPL"])
+    assert cache.get_price("AAPL") is None
+    await src.stop()
+
+
 async def test_start_primes_cache_then_polls_in_background():
     count = 0
 

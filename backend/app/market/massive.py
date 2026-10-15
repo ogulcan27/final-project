@@ -84,7 +84,10 @@ class MassiveSource(MarketDataSource):
             await self.poll_once()
 
     async def poll_once(self) -> None:
-        """One snapshot request for all tracked tickers; failures are logged, not raised."""
+        """One snapshot request for all tracked tickers.
+
+        Failures are logged, not raised, so one bad poll never stops polling.
+        """
         if not self._tickers:
             return
         try:
@@ -93,8 +96,11 @@ class MassiveSource(MarketDataSource):
             )
             resp.raise_for_status()
             prices = parse_snapshot(resp.json())
-        except (httpx.HTTPError, ValueError) as exc:
+        except httpx.HTTPError as exc:
             log.warning("Massive poll failed: %s", exc)
+            return
+        except Exception:
+            log.exception("Unexpected Massive response")
             return
         for ticker, (price, prev_close) in prices.items():
             if ticker in self._tickers:

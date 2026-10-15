@@ -482,7 +482,10 @@ class MassiveSource(MarketDataSource):
             await self.poll_once()
 
     async def poll_once(self) -> None:
-        """One snapshot request for all tracked tickers; failures are logged, not raised."""
+        """One snapshot request for all tracked tickers.
+
+        Failures are logged, not raised, so one bad poll never stops polling.
+        """
         if not self._tickers:
             return
         try:
@@ -490,12 +493,19 @@ class MassiveSource(MarketDataSource):
                 SNAPSHOT_PATH, params={"tickers": ",".join(sorted(self._tickers))}
             )
             resp.raise_for_status()
+            prices = parse_snapshot(resp.json())
         except httpx.HTTPError as exc:
             log.warning("Massive poll failed: %s", exc)
             return
-        for ticker, (price, prev_close) in parse_snapshot(resp.json()).items():
-            self.cache.update(ticker, price, prev_close=prev_close)
+        except Exception:
+            log.exception("Unexpected Massive response")
+            return
+        for ticker, (price, prev_close) in prices.items():
+            if ticker in self._tickers:  # skip tickers removed during the request
+                self.cache.update(ticker, price, prev_close=prev_close)
 ```
+
+The broad `except Exception` is deliberate: this loop talks to an external service, and an unexpected payload (e.g. `"tickers": null`, an item without `"ticker"`) must not end the background task. It also keeps a bad first poll in `start()` from blocking app startup.
 
 ### 7.3 Polling interval
 
@@ -504,7 +514,8 @@ Env var `MASSIVE_POLL_SECONDS` (default `15`, matching the free tier's 5 calls/m
 ### 7.4 Behavior to be aware of
 
 - A newly added ticker has no price until the next poll (up to 15s). Trade and watchlist code must handle `cache.get_price(t) is None` (return HTTP 400 "price not available yet", do not crash).
-- On HTTP 429 or network errors the previous prices stay in the cache and the next poll retries. Prices go stale but the app keeps working. SSE sends only when a cache timestamp changes, so stale tickers are not re-pushed.
+- On HTTP 429, network errors or a malformed payload the previous prices stay in the cache and the next poll retries. Prices go stale but the app keeps working. SSE sends only when a cache entry changes, so stale tickers are not re-pushed; keep-alive pings hold the connection open meanwhile.
+- `start()` awaits the first poll, so with a slow Massive API startup can take up to the 10s client timeout. Accepted: the first SSE push then has data.
 - Between polls prices are flat, so the UI flashes every ~15s instead of every 500ms. That is expected for REST polling.
 - A ticker added with an invalid symbol appears in the watchlist with no price. The watchlist route should reject a symbol that has no price after the first poll (optional validation, see section 9).
 
@@ -602,47 +613,60 @@ async def remove_watchlist(ticker: str, request: Request):
     return {"ticker": ticker}
 ```
 
+Note: `remove_ticker` followed by `add_ticker` re-seeds a simulated ticker at its seed price (e.g. AAPL back to 190.00). This only affects watch-only tickers, because held tickers are never removed from the source.
+
 `GET /api/watchlist` joins DB tickers with `cache.get(ticker).to_dict()` (price, change_pct, direction). The chat flow's `watchlist_changes` and `trades` use the same helpers as the REST routes, so source sync is identical for manual and AI-driven changes.
 
 ## 10. SSE Endpoint
 
 `app/market/stream.py`
 
+Uses FastAPI's native SSE support (`fastapi.sse`, FastAPI >= 0.135).
+
 ```python
 import asyncio
-import json
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Request
-from fastapi.responses import StreamingResponse
+from fastapi.sse import EventSourceResponse, ServerSentEvent
+
+from .cache import PriceCache
+from .models import PriceUpdate
 
 router = APIRouter(prefix="/api/stream")
 
 PUSH_SECONDS = 0.5
+RETRY_MS = 1000
 
 
-@router.get("/prices")
-async def stream_prices(request: Request) -> StreamingResponse:
-    """Long-lived SSE stream: one event per ticker whose price changed since last push."""
-    cache = request.app.state.price_cache
+async def price_events(
+    cache: PriceCache, interval: float = PUSH_SECONDS
+) -> AsyncIterator[ServerSentEvent]:
+    """Yield SSE events forever: all tickers first, then only tickers that changed.
 
-    async def events():
-        yield "retry: 1000\n\n"  # EventSource reconnect delay in ms
-        last_sent: dict[str, float] = {}
-        while not await request.is_disconnected():
-            for update in cache.all():
-                if last_sent.get(update.ticker) != update.timestamp:
-                    last_sent[update.ticker] = update.timestamp
-                    yield f"data: {json.dumps(update.to_dict())}\n\n"
-            await asyncio.sleep(PUSH_SECONDS)
+    Every cache write creates a new PriceUpdate, so identity marks a change.
+    """
+    yield ServerSentEvent(retry=RETRY_MS)
+    last_sent: dict[str, PriceUpdate] = {}
+    while True:
+        for update in cache.all():
+            if last_sent.get(update.ticker) is not update:
+                last_sent[update.ticker] = update
+                yield ServerSentEvent(data=update.to_dict())
+        await asyncio.sleep(interval)
 
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+
+@router.get("/prices", response_class=EventSourceResponse)
+async def stream_prices(request: Request) -> AsyncIterator[ServerSentEvent]:
+    """Long-lived SSE stream of live price updates, with keep-alive pings."""
+    async for event in price_events(request.app.state.price_cache):
+        yield event
 ```
 
+- `EventSourceResponse` sets `Cache-Control: no-cache` and `X-Accel-Buffering: no`, sends a `: ping` comment after 15s of silence (keeps proxies from closing idle connections, e.g. Massive between polls or when the market is closed), and cancels the generator when the client disconnects.
+- Changes are detected by `PriceUpdate` identity, not by timestamp, so two writes inside one clock tick are never merged.
 - On connect, every ticker is pushed immediately (initial state), then only changes.
+- Removals are not streamed. After `remove_ticker` the ticker simply stops appearing; the frontend must drop it from its state based on `GET /api/watchlist` (refresh after add/remove), not on the stream.
 - With the simulator every ticker changes each tick, so ~10 small events per 500ms. With Massive, events burst once per poll.
 - Reconnection: the browser `EventSource` reconnects automatically after `retry`. A fresh connection re-sends all tickers, so no `Last-Event-ID` handling is needed.
 - No auth, no CORS: same origin.
@@ -807,31 +831,27 @@ def test_factory_selects_source(monkeypatch):
 ```
 
 ```python
-# test_stream.py - SSE format and change-only pushes
-import json
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+# test_stream.py - change-only pushes, driven directly on the generator
 from app.market import PriceCache
-from app.market.stream import router
+from app.market.stream import price_events
 
-def test_sse_first_event_is_a_price():
-    app = FastAPI()
-    app.state.price_cache = PriceCache()
-    app.state.price_cache.update("AAPL", 190.0, prev_close=189.0)
-    app.include_router(router)
-    with TestClient(app).stream("GET", "/api/stream/prices") as r:
-        assert r.headers["content-type"].startswith("text/event-stream")
-        lines = r.iter_lines()
-        data = next(line for line in lines if line.startswith("data:"))
-        assert json.loads(data[5:])["ticker"] == "AAPL"
+async def test_changed_ticker_is_resent_with_direction():
+    cache = PriceCache()
+    cache.update("AAPL", 190.0)
+    gen = price_events(cache, interval=0)
+    await anext(gen); await anext(gen)          # retry, initial AAPL
+    cache.update("AAPL", 191.0)
+    assert (await anext(gen)).data["direction"] == "up"
 ```
+
+The stream is infinite, so `TestClient` / `httpx.ASGITransport` (which buffer the whole body) cannot test it over HTTP. The real-HTTP tests in `tests/market/test_stream.py` start `uvicorn.Server` on a free port in a fixture and read it with `httpx.AsyncClient.stream`; they check headers, the wire format, and the keep-alive ping (with `fastapi.routing._PING_INTERVAL` patched to 0.05s). The full suite lives in `backend/tests/market/`.
 
 Manual smoke test once the backend runs:
 
 ```bash
-cd backend && uv run uvicorn app.main:app --port 8000
+cd backend && uv run --env-file ../.env uvicorn app.main:app --port 8000
 curl -N http://localhost:8000/api/stream/prices        # simulator: ~10 events / 500ms
-MASSIVE_API_KEY=xxx uv run uvicorn app.main:app        # real data: burst every 15s
+# with MASSIVE_API_KEY set in .env: real data, burst every 15s
 ```
 
 ## 13. Implementation Order
