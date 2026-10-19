@@ -5,11 +5,14 @@ requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.143.1",
     "httpx>=0.28.1",
+    "litellm>=1.106.0",
+    "python-dotenv>=1.2.4",
     "uvicorn>=0.54.0",
 ]
 
 [dependency-groups]
 dev = [
+    "httpx2>=2.14.0",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "rich>=15.0.0",

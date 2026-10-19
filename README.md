@@ -4,7 +4,7 @@ An AI-powered trading terminal with simulated money. It streams live prices, let
 
 Capstone project for an agentic AI coding course. The app is built by coding agents that coordinate through the docs in `planning/`.
 
-> **Status:** planning stage. The full specification is in [planning/PLAN.md](planning/PLAN.md).
+The full specification is in [planning/PLAN.md](planning/PLAN.md).
 
 ## Features
 
@@ -24,7 +24,9 @@ Capstone project for an agentic AI coding course. The app is built by coding age
 | AI       | LiteLLM -> OpenRouter, `nvidia/nemotron-3-super-120b-a12b:free`, Structured Outputs |
 | Runtime  | Single Docker container on port 8000                       |
 
-## Quick Start (planned)
+## Quick Start
+
+Requires Docker.
 
 1. Copy `.env.example` to `.env` and set your key:
 
@@ -41,7 +43,11 @@ Capstone project for an agentic AI coding course. The app is built by coding age
    ./scripts/start_windows.ps1     # Windows PowerShell
    ```
 
+   The image is built on first run; pass `--build` (`-Build` on Windows) to rebuild.
+
 3. Open http://localhost:8000
+
+Stop with `./scripts/stop_mac.sh` or `./scripts/stop_windows.ps1`. Data persists in the `finally-data` Docker volume. `docker compose up --build` also works.
 
 The free model allows 50 requests per day. Use `LLM_MOCK=true` during development.
 
